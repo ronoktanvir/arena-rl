@@ -1,45 +1,32 @@
-"""Neural network policy definitions used by Arena-RL agents.
-
-This module provides two policy architectures tailored for image-based
-observations coming from :class:`envs.crlite_env.CRLiteEnv`.  Both policies
-consume RGB frames of shape ``(B, C, H, W)`` (with ``C=3``) and produce a pair
-of tensors: categorical action logits for the discrete action space with nine
-choices and a scalar state-value estimate.
-
-The :class:`ConvPolicy` is a feed-forward convolutional policy suitable for
-single-frame decision making.  The :class:`ConvLSTMPolicy` extends that encoder
-with an ``LSTM`` core so that downstream algorithms can keep temporal state
-when they require recurrent processing.
-"""
+"""Policy network implementations used by Arena-RL agents."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor, nn
 
-__all__ = ["ConvPolicy", "ConvLSTMPolicy", "MaskedCategoricalOutput"]
-
+__all__ = ["ConvPolicy", "ConvLSTMPolicy"]
 
 NEG_INF = -1e9
 
 
-def _prepare_observation(obs: Tensor) -> Tensor:
-    """Ensure the observation tensor follows the ``(B, C, H, W)`` convention."""
+def _format_observation(obs: Tensor) -> Tensor:
+    """Convert observations to float tensors shaped as ``(B, C, H, W)``."""
 
-    if obs.dim() == 3:  # (C, H, W) or (H, W, C)
+    if obs.dim() == 3:  # (H, W, C) or (C, H, W)
         obs = obs.unsqueeze(0)
     if obs.shape[1] != 3 and obs.shape[-1] == 3:
         obs = obs.permute(0, 3, 1, 2)
-    if obs.dtype != torch.float32:
-        obs = obs.float()
+    obs = obs.float() / 255.0 if obs.dtype != torch.float32 else obs
+    if obs.max().item() > 1.0:
+        obs = obs / 255.0
     return obs
 
 
-def _prepare_action_mask(mask: Optional[Tensor], batch_size: int) -> Optional[Tensor]:
-    """Normalise the action mask to a float tensor for masking logits."""
+def _format_action_mask(mask: Optional[Tensor], batch_size: int) -> Optional[Tensor]:
+    """Ensure the action mask is boolean with a batch dimension."""
 
     if mask is None:
         return None
@@ -50,17 +37,8 @@ def _prepare_action_mask(mask: Optional[Tensor], batch_size: int) -> Optional[Te
     return mask.to(dtype=torch.bool)
 
 
-@dataclass
-class MaskedCategoricalOutput:
-    """Container for the outputs of a masked policy network."""
-
-    logits: Tensor
-    value: Tensor
-    next_state: Optional[Tuple[Tensor, Tensor]] = None
-
-
 class ConvPolicy(nn.Module):
-    """Feed-forward convolutional policy producing action logits and values."""
+    """Feed-forward convolutional policy producing logits and state-values."""
 
     def __init__(self, input_channels: int = 3, hidden_size: int = 512) -> None:
         super().__init__()
@@ -73,8 +51,12 @@ class ConvPolicy(nn.Module):
             nn.ReLU(inplace=True),
             nn.Flatten(),
         )
-        self.head = nn.Sequential(
-            nn.Linear(64 * 12 * 12, hidden_size),
+        with torch.no_grad():
+            dummy = torch.zeros(1, input_channels, 96, 96)
+            conv_out = self.encoder(dummy)
+            self._flat_size = conv_out.shape[-1]
+        self.fc = nn.Sequential(
+            nn.Linear(self._flat_size, hidden_size),
             nn.ReLU(inplace=True),
         )
         self.policy_head = nn.Linear(hidden_size, 9)
@@ -86,28 +68,27 @@ class ConvPolicy(nn.Module):
         action_mask: Optional[Tensor] = None,
         hx: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Tensor, Optional[Tuple[Tensor, Tensor]]]:
-        del hx  # Not used but kept for API parity with recurrent policies.
+        del hx  # feed-forward policy ignores hidden state
 
-        obs = _prepare_observation(obs)
+        obs = _format_observation(obs)
         features = self.encoder(obs)
-        hidden = self.head(features)
+        hidden = self.fc(features)
 
         logits = self.policy_head(hidden)
-        mask = _prepare_action_mask(action_mask, logits.shape[0])
+        mask = _format_action_mask(action_mask, logits.shape[0])
         if mask is not None:
-            invalid = ~mask
-            logits = logits.masked_fill(invalid, NEG_INF)
+            logits = logits.masked_fill(~mask, NEG_INF)
 
         value = self.value_head(hidden)
         return logits, value, None
 
-    def to(self, device: torch.device | str) -> "ConvPolicy":
+    def to(self, device: torch.device | str) -> "ConvPolicy":  # type: ignore[override]
         super().to(device)
         return self
 
 
 class ConvLSTMPolicy(nn.Module):
-    """Recurrent convolutional policy with an LSTM core."""
+    """Convolutional encoder with an LSTM core for temporal credit assignment."""
 
     def __init__(
         self,
@@ -125,8 +106,12 @@ class ConvLSTMPolicy(nn.Module):
             nn.ReLU(inplace=True),
             nn.Flatten(),
         )
-        self.projection = nn.Sequential(
-            nn.Linear(64 * 12 * 12, hidden_size),
+        with torch.no_grad():
+            dummy = torch.zeros(1, input_channels, 96, 96)
+            conv_out = self.encoder(dummy)
+            self._flat_size = conv_out.shape[-1]
+        self.proj = nn.Sequential(
+            nn.Linear(self._flat_size, hidden_size),
             nn.ReLU(inplace=True),
         )
         self.lstm = nn.LSTM(hidden_size, lstm_hidden_size, batch_first=True)
@@ -139,20 +124,17 @@ class ConvLSTMPolicy(nn.Module):
         action_mask: Optional[Tensor] = None,
         hx: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tuple[Tensor, Tensor, Tuple[Tensor, Tensor]]:
-        obs = _prepare_observation(obs)
+        obs = _format_observation(obs)
         batch_size = obs.shape[0]
-        # Recurrent policies typically expect (B, T, C, H, W). We allow callers to
-        # pass either ``(B, C, H, W)`` or ``(B, T, C, H, W)`` and reshape as needed.
         if obs.dim() == 4:
             obs = obs.unsqueeze(1)
         elif obs.dim() != 5:
-            raise ValueError("Expected observation with shape (B,T,C,H,W) or (B,C,H,W)")
+            raise ValueError("Expected observation with shape (B,C,H,W) or (B,T,C,H,W)")
 
         b, t, c, h, w = obs.shape
-        obs = obs.reshape(b * t, c, h, w)
+        obs = obs.view(b * t, c, h, w)
         features = self.encoder(obs)
-        projected = self.projection(features)
-        projected = projected.view(b, t, -1)
+        projected = self.proj(features).view(b, t, -1)
 
         if hx is None:
             device = projected.device
@@ -162,16 +144,15 @@ class ConvLSTMPolicy(nn.Module):
             )
 
         lstm_out, next_hx = self.lstm(projected, hx)
-        # For policy/value heads we only use the last timestep output.
         last_out = lstm_out[:, -1]
         logits = self.policy_head(last_out)
-        mask = _prepare_action_mask(action_mask, logits.shape[0])
+        mask = _format_action_mask(action_mask, logits.shape[0])
         if mask is not None:
             logits = logits.masked_fill(~mask, NEG_INF)
 
         value = self.value_head(last_out)
         return logits, value, next_hx
 
-    def to(self, device: torch.device | str) -> "ConvLSTMPolicy":
+    def to(self, device: torch.device | str) -> "ConvLSTMPolicy":  # type: ignore[override]
         super().to(device)
         return self
