@@ -1,5 +1,6 @@
 gymnasium
 pygame
+pygame==2.5.2
 numpy
 matplotlib
 pyyaml
@@ -8,6 +9,7 @@ opencv-python
 torch
 torchvision
 torchaudio
+
 wandb
 tensorboard
 streamlit
