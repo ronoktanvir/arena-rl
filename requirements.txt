@@ -1,0 +1,13 @@
+gymnasium
+pygame
+numpy
+matplotlib
+pyyaml
+tqdm
+opencv-python
+torch
+torchvision
+torchaudio
+wandb
+tensorboard
+streamlit
