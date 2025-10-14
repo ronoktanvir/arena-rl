@@ -1,36 +1,17 @@
-"""Proximal Policy Optimisation trainer for Arena-RL policies.
-
-This module provides a lean yet fully featured PPO implementation capable of
-training either the feed-forward :class:`agents.nets.ConvPolicy` or the
-recurrent :class:`agents.nets.ConvLSTMPolicy` on the ``CRLiteEnv`` environment.
-It supports vectorised environment rollouts, Generalised Advantage Estimation,
-and the clipped PPO objective together with entropy and value function losses.
-
-The primary entry point is :class:`PPOTrainer`, which exposes two convenience
-methods:
-
-``train(config_path: str)``
-    Load hyperparameters from a YAML configuration file and launch training.
-
-``evaluate(ckpt_path: str, episodes: int)``
-    Run evaluation episodes using a saved checkpoint.
-"""
+"""Minimal Proximal Policy Optimisation trainer used for CR-Lite."""
 
 from __future__ import annotations
 
-import math
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
 import torch
-import torch.nn.functional as F
-import yaml
 from torch import Tensor
 from torch.distributions import Categorical
+import yaml
 
 from agents.nets import ConvLSTMPolicy, ConvPolicy
 from envs.crlite_env import CRLiteEnv
@@ -38,100 +19,53 @@ from envs.crlite_env import CRLiteEnv
 __all__ = ["PPOTrainer"]
 
 
-def _to_tensor(obs: np.ndarray, device: torch.device) -> Tensor:
-    """Convert an RGB observation to a normalised ``torch.Tensor``."""
+def _select_device() -> torch.device:
+    """Choose the preferred training device."""
 
-    tensor = torch.from_numpy(obs).to(device=device, dtype=torch.float32)
-    if tensor.ndim == 3:  # (H, W, C)
-        tensor = tensor.permute(2, 0, 1).unsqueeze(0)
-    elif tensor.ndim == 4:  # (B, H, W, C)
-        tensor = tensor.permute(0, 3, 1, 2)
-    else:
-        raise ValueError(f"Unexpected observation shape: {tensor.shape}")
-    return tensor / 255.0
-
-
-def _to_mask(mask: np.ndarray, device: torch.device) -> Tensor:
-    """Convert a numpy action mask to a boolean tensor."""
-
-    tensor = torch.from_numpy(mask).to(device=device)
-    if tensor.ndim == 1:
-        tensor = tensor.unsqueeze(0)
-    return tensor.to(dtype=torch.bool)
-
-
-def _default_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
 
 
-@dataclass
-class RolloutBatch:
-    """Container keeping track of rollout tensors for PPO updates."""
+def _obs_to_tensor(obs: np.ndarray, device: torch.device) -> Tensor:
+    """Convert observations to ``(B, C, H, W)`` float tensors."""
 
-    obs: Tensor
-    action_masks: Tensor
-    actions: Tensor
-    logprobs: Tensor
-    rewards: Tensor
-    dones: Tensor
-    values: Tensor
-    advantages: Optional[Tensor] = None
-    returns: Optional[Tensor] = None
-    h0: Optional[Tensor] = None
-    c0: Optional[Tensor] = None
+    tensor = torch.as_tensor(obs, device=device, dtype=torch.float32)
+    if tensor.ndim == 3:  # (H, W, C)
+        tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+    elif tensor.ndim == 4:  # (B, H, W, C)
+        tensor = tensor.permute(0, 3, 1, 2)
+    else:
+        raise ValueError(f"Unsupported observation shape: {tensor.shape}")
+    return tensor
 
-    @property
-    def num_steps(self) -> int:
-        return self.obs.shape[0]
 
-    @property
-    def num_envs(self) -> int:
-        return self.obs.shape[1]
+def _mask_to_tensor(mask: np.ndarray, device: torch.device) -> Tensor:
+    """Convert action masks to boolean tensors with a batch dimension."""
 
-    @property
-    def obs_shape(self) -> Tuple[int, ...]:
-        return tuple(self.obs.shape[2:])
-
-    @property
-    def action_dim(self) -> int:
-        return self.action_masks.shape[-1]
-
-    def flatten(self) -> Tuple[Tensor, ...]:
-        """Return feed-forward views where time and env dimensions are merged."""
-
-        t, n = self.num_steps, self.num_envs
-        view = lambda x: x.view(t * n, *x.shape[2:]) if x.ndim > 2 else x.view(t * n)
-        return (
-            view(self.obs),
-            view(self.action_masks),
-            view(self.actions),
-            view(self.logprobs),
-            view(self.advantages),
-            view(self.returns),
-            view(self.values),
-        )
+    tensor = torch.as_tensor(mask, device=device)
+    if tensor.ndim == 1:
+        tensor = tensor.unsqueeze(0)
+    return tensor.to(dtype=torch.bool)
 
 
 class PPOTrainer:
-    """Utility class orchestrating PPO training and evaluation."""
+    """Lean PPO trainer with vectorised rollouts and optional LSTM support."""
 
     def __init__(self) -> None:
-        self.device = _default_device()
-        self.checkpoint_dir = Path("checkpoints")
-        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.device = _select_device()
 
     # ------------------------------------------------------------------
     # Configuration helpers
     # ------------------------------------------------------------------
     @staticmethod
-    def _load_config(path: str) -> Dict:
+    def _load_config(path: str) -> Dict[str, object]:
         with open(path, "r", encoding="utf-8") as handle:
-            cfg = yaml.safe_load(handle)
-        if not isinstance(cfg, dict):
-            raise ValueError("Configuration file must contain a mapping.")
-        required = {
+            config = yaml.safe_load(handle)
+        if not isinstance(config, dict):
+            raise ValueError("Configuration file must contain a mapping of hyperparameters.")
+
+        required_keys = {
             "learning_rate",
             "gamma",
             "gae_lambda",
@@ -143,412 +77,440 @@ class PPOTrainer:
             "minibatch_size",
             "num_envs",
             "use_lstm",
+            "opponent",
+            "save_dir",
         }
-        missing = sorted(required - cfg.keys())
+        missing = required_keys - config.keys()
         if missing:
-            raise KeyError(f"Missing PPO config keys: {', '.join(missing)}")
-        return cfg
+            raise KeyError(f"Missing PPO configuration keys: {sorted(missing)}")
+        return config
 
     # ------------------------------------------------------------------
     # Environment factories
     # ------------------------------------------------------------------
     @staticmethod
-    def _make_env(seed: Optional[int] = None) -> gym.Env:
-        return CRLiteEnv(opponent_policy="greedy", seed=seed, render_mode="rgb_array")
-
-    def _vector_env(self, num_envs: int, *, base_seed: Optional[int]) -> gym.vector.VectorEnv:
-        def make_thunk(rank: int) -> callable:
+    def _make_vector_env(num_envs: int, opponent: str, seed: Optional[int]) -> gym.vector.VectorEnv:
+        def make_env(rank: int):
             def _init() -> CRLiteEnv:
-                seed = None if base_seed is None else base_seed + rank
-                return self._make_env(seed)
+                env_seed = None if seed is None else seed + rank
+                return CRLiteEnv(opponent_policy=opponent, seed=env_seed, render_mode="rgb_array")
 
             return _init
 
-        thunks = [make_thunk(i) for i in range(num_envs)]
+        thunks = [make_env(i) for i in range(num_envs)]
         return gym.vector.SyncVectorEnv(thunks)
 
     # ------------------------------------------------------------------
     # Rollout collection
     # ------------------------------------------------------------------
-    def _collect_rollouts(
+    def _collect_rollout(
         self,
         envs: gym.vector.VectorEnv,
         policy: torch.nn.Module,
         obs: np.ndarray,
         info: Dict[str, np.ndarray],
-        running_returns: np.ndarray,
+        *,
         num_steps: int,
         gamma: float,
         gae_lambda: float,
-        *,
         use_lstm: bool,
-        lstm_hidden_size: Optional[int] = None,
-        hx: Optional[Tuple[Tensor, Tensor]] = None,
-    ) -> Tuple[RolloutBatch, np.ndarray, Dict[str, np.ndarray], Optional[Tuple[Tensor, Tensor]], List[float], List[float]]:
+        lstm_hidden_size: Optional[int],
+        episode_returns: np.ndarray,
+        episode_lengths: np.ndarray,
+        optimizer_device: torch.device,
+        hx: Optional[Tuple[Tensor, Tensor]],
+    ) -> Tuple[Dict[str, Tensor], np.ndarray, Dict[str, np.ndarray], Optional[Tuple[Tensor, Tensor]], List[float], List[int], List[bool]]:
+        """Sample a rollout of ``num_steps`` transitions from the vectorised env."""
+
         num_envs = envs.num_envs
-        if use_lstm and hx is None:
-            if lstm_hidden_size is None:
-                raise ValueError("lstm_hidden_size must be provided when use_lstm is True")
-            hx = (
-                torch.zeros(1, num_envs, lstm_hidden_size, device=self.device),
-                torch.zeros(1, num_envs, lstm_hidden_size, device=self.device),
-            )
+        obs_tensor = _obs_to_tensor(obs, optimizer_device)
+        obs_shape = obs_tensor.shape[1:]
+        action_dim = info["action_mask"].shape[-1]
 
-        obs_tensor = _to_tensor(obs, self.device)
-        obs_shape = tuple(obs_tensor.shape[1:])
-        batch = RolloutBatch(
-            obs=torch.zeros(num_steps, num_envs, *obs_shape, dtype=torch.float32),
-            action_masks=torch.zeros(num_steps, num_envs, 9, dtype=torch.bool),
-            actions=torch.zeros(num_steps, num_envs, dtype=torch.long),
-            logprobs=torch.zeros(num_steps, num_envs, dtype=torch.float32),
-            rewards=torch.zeros(num_steps, num_envs, dtype=torch.float32),
-            dones=torch.zeros(num_steps, num_envs, dtype=torch.float32),
-            values=torch.zeros(num_steps, num_envs, dtype=torch.float32),
-            h0=None,
-            c0=None,
-        )
+        storage: Dict[str, Tensor] = {
+            "obs": torch.zeros((num_steps, num_envs, *obs_shape), device=optimizer_device),
+            "masks": torch.zeros((num_steps, num_envs, action_dim), device=optimizer_device, dtype=torch.bool),
+            "actions": torch.zeros((num_steps, num_envs), device=optimizer_device, dtype=torch.long),
+            "logprobs": torch.zeros((num_steps, num_envs), device=optimizer_device),
+            "rewards": torch.zeros((num_steps, num_envs), device=optimizer_device),
+            "dones": torch.zeros((num_steps, num_envs), device=optimizer_device),
+            "values": torch.zeros((num_steps, num_envs), device=optimizer_device),
+        }
+        if use_lstm:
+            if hx is None:
+                if lstm_hidden_size is None:
+                    raise ValueError("lstm_hidden_size must be provided when using an LSTM policy.")
+                hx = (
+                    torch.zeros(1, num_envs, lstm_hidden_size, device=optimizer_device),
+                    torch.zeros(1, num_envs, lstm_hidden_size, device=optimizer_device),
+                )
+            storage["lstm_h"] = torch.zeros((num_steps, num_envs, hx[0].shape[-1]), device=optimizer_device)
+            storage["lstm_c"] = torch.zeros((num_steps, num_envs, hx[1].shape[-1]), device=optimizer_device)
 
-        if use_lstm and hx is not None:
-            batch.h0 = hx[0].detach().cpu()
-            batch.c0 = hx[1].detach().cpu()
-
-        episode_returns = running_returns.copy()
-        completed_returns: List[float] = []
-        completed_wins: List[float] = []
+        finished_returns: List[float] = []
+        finished_lengths: List[int] = []
+        finished_wins: List[bool] = []
 
         for step in range(num_steps):
-            obs_tensor = _to_tensor(obs, self.device)
-            mask_tensor = _to_mask(info["action_mask"], self.device)
-            with torch.no_grad():
-                logits, value, next_hx = policy(obs_tensor, mask_tensor, hx)
-                dist = Categorical(logits=logits)
-                actions = dist.sample()
-                logprob = dist.log_prob(actions)
+            obs_tensor = _obs_to_tensor(obs, optimizer_device)
+            mask_tensor = _mask_to_tensor(info["action_mask"], optimizer_device)
 
-            batch.obs[step] = obs_tensor.cpu()
-            batch.action_masks[step] = mask_tensor.cpu()
-            batch.actions[step] = actions.cpu()
-            batch.logprobs[step] = logprob.cpu()
-            batch.values[step] = value.squeeze(-1).cpu()
+            if use_lstm and hx is not None:
+                storage["lstm_h"][step].copy_(hx[0].squeeze(0))
+                storage["lstm_c"][step].copy_(hx[1].squeeze(0))
 
-            actions_np = actions.cpu().numpy()
-            obs, reward, terminated, truncated, info = envs.step(actions_np)
+            storage["obs"][step].copy_(obs_tensor)
+            storage["masks"][step].copy_(mask_tensor)
+
+            logits, value, next_hx = policy(obs_tensor, action_mask=mask_tensor, hx=hx)
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+            log_prob = dist.log_prob(action)
+
+            storage["actions"][step] = action
+            storage["logprobs"][step] = log_prob
+            storage["values"][step] = value.squeeze(-1)
+
+            next_obs, reward, terminated, truncated, next_info = envs.step(action.cpu().numpy())
             done = np.logical_or(terminated, truncated)
 
-            batch.rewards[step] = torch.from_numpy(reward).to(dtype=torch.float32)
-            batch.dones[step] = torch.from_numpy(done).to(dtype=torch.float32)
+            reward_tensor = torch.as_tensor(reward, device=optimizer_device, dtype=torch.float32)
+            done_tensor = torch.as_tensor(done, device=optimizer_device, dtype=torch.float32)
+            storage["rewards"][step] = reward_tensor
+            storage["dones"][step] = done_tensor
 
             episode_returns += reward
-            win_array = np.zeros(num_envs, dtype=np.float32)
-            if done.any():
-                for idx in np.where(done)[0]:
-                    env = envs.envs[idx]
-                    win_flag = float(not env.opponent_towers["king"].alive)
-                    completed_returns.append(float(episode_returns[idx]))
-                    completed_wins.append(win_flag)
-                    win_array[idx] = win_flag
-                    episode_returns[idx] = 0.0
-            info["win"] = win_array
+            episode_lengths += 1
 
-            if use_lstm and next_hx is not None:
-                hx = (next_hx[0].clone(), next_hx[1].clone())
-                done_tensor = torch.from_numpy(done).to(self.device)
-                if done_tensor.any():
-                    mask = (1.0 - done_tensor.float()).view(1, -1, 1)
-                    hx = (hx[0] * mask, hx[1] * mask)
-            else:
-                hx = None
+            final_info = next_info.get("final_info") if isinstance(next_info, dict) else None
+            for env_index, finished in enumerate(done):
+                if not finished:
+                    continue
+                finfo = None
+                if final_info is not None:
+                    finfo = final_info[env_index]
+                win_flag = False
+                if isinstance(finfo, dict):
+                    win_flag = bool(finfo.get("win", False))
+                elif isinstance(next_info, dict):
+                    # Fall back to stacked info arrays
+                    win_array = next_info.get("win")
+                    if win_array is not None:
+                        win_flag = bool(win_array[env_index])
+                finished_returns.append(float(episode_returns[env_index]))
+                finished_lengths.append(int(episode_lengths[env_index]))
+                finished_wins.append(win_flag)
+                episode_returns[env_index] = 0.0
+                episode_lengths[env_index] = 0
+                if use_lstm and hx is not None:
+                    hx[0][:, env_index] = 0.0
+                    hx[1][:, env_index] = 0.0
 
-        # Compute value of last observation for GAE.
-        obs_tensor = _to_tensor(obs, self.device)
-        mask_tensor = _to_mask(info["action_mask"], self.device)
+            hx = None if next_hx is None else (next_hx[0].detach(), next_hx[1].detach())
+
+            obs = next_obs
+            info = next_info
+
+        # Bootstrap the final value
+        last_obs_tensor = _obs_to_tensor(obs, optimizer_device)
+        last_mask_tensor = _mask_to_tensor(info["action_mask"], optimizer_device)
+        hx_for_value: Optional[Tuple[Tensor, Tensor]] = None
+        if use_lstm and hx is not None:
+            hx_for_value = (hx[0].clone(), hx[1].clone())
         with torch.no_grad():
-            last_value = policy(obs_tensor, mask_tensor, hx)[1].squeeze(-1)
+            _, next_value, _ = policy(last_obs_tensor, action_mask=last_mask_tensor, hx=hx_for_value)
+        storage["next_value"] = next_value.squeeze(-1)
 
-        values = torch.cat([batch.values, last_value.cpu().unsqueeze(0)], dim=0)
-        advantages = torch.zeros_like(batch.rewards)
-        last_advantage = torch.zeros(num_envs, dtype=torch.float32)
-        for t in reversed(range(num_steps)):
-            next_non_terminal = 1.0 - batch.dones[t]
-            delta = (
-                batch.rewards[t]
-                + gamma * values[t + 1] * next_non_terminal
-                - values[t]
-            )
-            last_advantage = delta + gamma * gae_lambda * next_non_terminal * last_advantage
-            advantages[t] = last_advantage
-        returns = advantages + batch.values
-        batch.advantages = advantages
-        batch.returns = returns
-
-        return batch, obs, info, hx, episode_returns, completed_returns, completed_wins
+        return storage, obs, info, hx, finished_returns, finished_lengths, finished_wins
 
     # ------------------------------------------------------------------
-    # Optimisation
+    # Advantage estimation
     # ------------------------------------------------------------------
-    def _feed_forward_minibatches(
-        self,
-        batch: RolloutBatch,
-        minibatch_size: int,
-        device: torch.device,
-    ) -> Iterable[Tuple[Tensor, ...]]:
-        obs, masks, actions, logprobs, advantages, returns, values = batch.flatten()
-        batch_size = obs.shape[0]
-        indices = torch.randperm(batch_size)
-        for start in range(0, batch_size, minibatch_size):
-            idx = indices[start : start + minibatch_size]
-            yield (
-                obs[idx].to(device),
-                masks[idx].to(device),
-                actions[idx].to(device),
-                logprobs[idx].to(device),
-                advantages[idx].to(device),
-                returns[idx].to(device),
-                values[idx].to(device),
-            )
-
-    def _recurrent_minibatches(
-        self,
-        batch: RolloutBatch,
-        minibatch_size: int,
-        device: torch.device,
-    ) -> Iterable[Tuple[Tensor, ...]]:
-        num_envs = batch.num_envs
-        indices = torch.randperm(num_envs)
-        for start in range(0, num_envs, minibatch_size):
-            env_idx = indices[start : start + minibatch_size]
-            obs = batch.obs[:, env_idx].to(device)
-            masks = batch.action_masks[:, env_idx].to(device)
-            actions = batch.actions[:, env_idx].to(device)
-            logprobs = batch.logprobs[:, env_idx].to(device)
-            advantages = batch.advantages[:, env_idx].to(device)
-            returns = batch.returns[:, env_idx].to(device)
-            values = batch.values[:, env_idx].to(device)
-            dones = batch.dones[:, env_idx].to(device)
-            if batch.h0 is None or batch.c0 is None:
-                raise RuntimeError("Missing initial hidden state for recurrent batch.")
-            h0 = batch.h0[:, env_idx].to(device)
-            c0 = batch.c0[:, env_idx].to(device)
-            yield obs, masks, actions, logprobs, advantages, returns, values, dones, (h0, c0)
-
     @staticmethod
-    def _recurrent_forward(
-        policy: ConvLSTMPolicy,
-        obs: Tensor,
-        masks: Tensor,
+    def _compute_gae(
+        rewards: Tensor,
+        values: Tensor,
         dones: Tensor,
-        hidden: Tuple[Tensor, Tensor],
+        next_value: Tensor,
+        *,
+        gamma: float,
+        gae_lambda: float,
     ) -> Tuple[Tensor, Tensor]:
-        outputs: List[Tensor] = []
-        values: List[Tensor] = []
-        hx = (hidden[0].clone(), hidden[1].clone())
-        timesteps = obs.shape[0]
-        for t in range(timesteps):
-            logits, value, hx = policy(obs[t], masks[t], hx)
-            outputs.append(logits)
-            values.append(value)
-            done_mask = (1.0 - dones[t]).view(1, -1, 1)
-            hx = (hx[0] * done_mask, hx[1] * done_mask)
-        return torch.stack(outputs), torch.stack(values)
+        num_steps, num_envs = rewards.shape
+        advantages = torch.zeros_like(rewards)
+        gae = torch.zeros(num_envs, device=rewards.device)
+        next_val = next_value
+        for step in reversed(range(num_steps)):
+            mask = 1.0 - dones[step]
+            delta = rewards[step] + gamma * next_val * mask - values[step]
+            gae = delta + gamma * gae_lambda * mask * gae
+            advantages[step] = gae
+            next_val = values[step]
+        returns = advantages + values
+        return advantages, returns
+
+    # ------------------------------------------------------------------
+    # Optimisation step
+    # ------------------------------------------------------------------
+    def _ppo_update(
+        self,
+        policy: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        storage: Dict[str, Tensor],
+        *,
+        num_epochs: int,
+        minibatch_size: int,
+        clip_eps: float,
+        entropy_coef: float,
+        value_coef: float,
+        use_lstm: bool,
+    ) -> Tuple[float, float, float]:
+        policy.train()
+        obs = storage["obs"].view(-1, *storage["obs"].shape[2:])
+        masks = storage["masks"].view(-1, storage["masks"].shape[-1])
+        actions = storage["actions"].view(-1)
+        old_logprobs = storage["logprobs"].view(-1)
+        advantages = storage["advantages"].view(-1)
+        returns = storage["returns"].view(-1)
+        advantages = (advantages - advantages.mean()) / (advantages.std(unbiased=False) + 1e-8)
+
+        if use_lstm:
+            lstm_h = storage["lstm_h"].view(-1, storage["lstm_h"].shape[-1])
+            lstm_c = storage["lstm_c"].view(-1, storage["lstm_c"].shape[-1])
+
+        batch_size = obs.shape[0]
+        indices = torch.randperm(batch_size, device=obs.device)
+
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        updates = 0
+
+        for _ in range(num_epochs):
+            for start in range(0, batch_size, minibatch_size):
+                end = start + minibatch_size
+                mb_idx = indices[start:end]
+
+                obs_batch = obs[mb_idx]
+                mask_batch = masks[mb_idx]
+                action_batch = actions[mb_idx]
+                old_logprob_batch = old_logprobs[mb_idx]
+                advantage_batch = advantages[mb_idx]
+                return_batch = returns[mb_idx]
+
+                hx_batch: Optional[Tuple[Tensor, Tensor]] = None
+                if use_lstm:
+                    h_batch = lstm_h[mb_idx].unsqueeze(0)
+                    c_batch = lstm_c[mb_idx].unsqueeze(0)
+                    hx_batch = (h_batch, c_batch)
+
+                logits, value, _ = policy(obs_batch, action_mask=mask_batch, hx=hx_batch)
+                dist = Categorical(logits=logits)
+                logprob = dist.log_prob(action_batch)
+                entropy = dist.entropy().mean()
+
+                ratio = (logprob - old_logprob_batch).exp()
+                surr1 = ratio * advantage_batch
+                surr2 = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantage_batch
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                value = value.squeeze(-1)
+                value_loss = 0.5 * (return_batch - value).pow(2).mean()
+
+                loss = policy_loss + value_coef * value_loss - entropy_coef * entropy
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
+                optimizer.step()
+
+                total_policy_loss += policy_loss.item()
+                total_value_loss += value_loss.item()
+                total_entropy += entropy.item()
+                updates += 1
+
+        if updates == 0:
+            return 0.0, 0.0, 0.0
+        return (
+            total_policy_loss / updates,
+            total_value_loss / updates,
+            total_entropy / updates,
+        )
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def train(self, config_path: str, *, log_interval: int = 10) -> None:
+    def train(self, config_path: str) -> None:
         config = self._load_config(config_path)
-        torch.manual_seed(config.get("seed", 0))
-        np.random.seed(config.get("seed", 0))
+        seed = config.get("seed")
+        if isinstance(seed, int):
+            torch.manual_seed(seed)
+            np.random.seed(seed)
 
         num_envs = int(config["num_envs"])
-        envs = self._vector_env(num_envs, base_seed=config.get("seed"))
-        obs, info = envs.reset(seed=config.get("seed"))
+        save_dir = Path(str(config["save_dir"]))
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        envs = self._make_vector_env(num_envs, str(config["opponent"]), seed if isinstance(seed, int) else None)
 
         use_lstm = bool(config["use_lstm"])
         if use_lstm:
-            policy: torch.nn.Module = ConvLSTMPolicy()
+            policy = ConvLSTMPolicy().to(self.device)
             lstm_hidden_size = policy.lstm.hidden_size
         else:
-            policy = ConvPolicy()
+            policy = ConvPolicy().to(self.device)
             lstm_hidden_size = None
-        policy = policy.to(self.device)
+
         optimizer = torch.optim.Adam(policy.parameters(), lr=float(config["learning_rate"]))
 
-        total_timesteps = config.get("total_timesteps")
-        if total_timesteps is not None:
-            timesteps_per_rollout = int(config["num_steps"]) * num_envs
-            total_updates = max(1, total_timesteps // timesteps_per_rollout)
-        else:
-            total_updates = int(config.get("num_updates", 1000))
+        obs, info = envs.reset(seed=seed if isinstance(seed, int) else None)
 
-        best_win_rate = -math.inf
-        returns_window: deque[float] = deque(maxlen=100)
-        wins_window: deque[float] = deque(maxlen=100)
+        episode_returns = np.zeros(num_envs, dtype=np.float32)
+        episode_lengths = np.zeros(num_envs, dtype=np.int32)
+        win_history: deque = deque(maxlen=100)
+        best_win_rate = -float("inf")
 
-        hx: Optional[Tuple[Tensor, Tensor]]
+        total_updates = int(config.get("total_updates", 1))
+
+        hx: Optional[Tuple[Tensor, Tensor]] = None
         if use_lstm:
+            hidden_size = lstm_hidden_size or 256
             hx = (
-                torch.zeros(1, num_envs, lstm_hidden_size, device=self.device),
-                torch.zeros(1, num_envs, lstm_hidden_size, device=self.device),
+                torch.zeros(1, num_envs, hidden_size, device=self.device),
+                torch.zeros(1, num_envs, hidden_size, device=self.device),
             )
-        else:
-            hx = None
-        running_returns = np.zeros(num_envs, dtype=np.float32)
-        for update in range(1, total_updates + 1):
-            batch, obs, info, hx, running_returns, completed_returns, completed_wins = self._collect_rollouts(
+
+        for update in range(total_updates):
+            storage, obs, info, hx, finished_returns, finished_lengths, finished_wins = self._collect_rollout(
                 envs,
                 policy,
                 obs,
                 info,
-                running_returns,
                 num_steps=int(config["num_steps"]),
                 gamma=float(config["gamma"]),
                 gae_lambda=float(config["gae_lambda"]),
                 use_lstm=use_lstm,
                 lstm_hidden_size=lstm_hidden_size,
+                episode_returns=episode_returns,
+                episode_lengths=episode_lengths,
+                optimizer_device=self.device,
                 hx=hx,
             )
 
-            advantages = batch.advantages
-            if advantages is None:
-                raise RuntimeError("Advantages were not computed during rollout collection.")
-            adv_flat = advantages.view(-1)
-            adv_mean = adv_flat.mean()
-            adv_std = adv_flat.std(unbiased=False)
-            batch.advantages = (advantages - adv_mean) / (adv_std + 1e-8)
+            win_history.extend(finished_wins)
 
-            for _ in range(int(config["update_epochs"])):
-                if use_lstm:
-                    for mb in self._recurrent_minibatches(batch, int(config["minibatch_size"]), self.device):
-                        obs_mb, masks_mb, actions_mb, old_logprob_mb, adv_mb, ret_mb, _, dones_mb, hidden_mb = mb
-                        logits_seq, values_seq = self._recurrent_forward(policy, obs_mb, masks_mb, dones_mb, hidden_mb)
-                        logits = logits_seq.view(-1, logits_seq.shape[-1])
-                        values = values_seq.view(-1)
-                        dist = Categorical(logits=logits)
-                        logprob = dist.log_prob(actions_mb.view(-1))
-                        entropy = dist.entropy().mean()
+            advantages, returns = self._compute_gae(
+                storage["rewards"],
+                storage["values"],
+                storage["dones"],
+                storage["next_value"],
+                gamma=float(config["gamma"]),
+                gae_lambda=float(config["gae_lambda"]),
+            )
+            storage["advantages"] = advantages
+            storage["returns"] = returns
 
-                        ratio = torch.exp(logprob - old_logprob_mb.view(-1))
-                        surr1 = ratio * adv_mb.view(-1)
-                        surr2 = torch.clamp(
-                            ratio,
-                            1.0 - float(config["clip_eps"]),
-                            1.0 + float(config["clip_eps"]),
-                        ) * adv_mb.view(-1)
-                        policy_loss = -torch.min(surr1, surr2).mean()
+            policy_loss, value_loss, entropy = self._ppo_update(
+                policy,
+                optimizer,
+                storage,
+                num_epochs=int(config["update_epochs"]),
+                minibatch_size=int(config["minibatch_size"]),
+                clip_eps=float(config["clip_eps"]),
+                entropy_coef=float(config["entropy_coef"]),
+                value_coef=float(config["value_coef"]),
+                use_lstm=use_lstm,
+            )
 
-                        value_loss = F.mse_loss(values, ret_mb.view(-1))
-                        loss = (
-                            policy_loss
-                            + float(config["value_coef"]) * value_loss
-                            - float(config["entropy_coef"]) * entropy
-                        )
+            mean_return = float(np.mean(finished_returns)) if finished_returns else 0.0
+            mean_length = float(np.mean(finished_lengths)) if finished_lengths else 0.0
+            win_rate = (sum(finished_wins) / len(finished_wins)) if finished_wins else 0.0
+            moving_win_rate = (sum(win_history) / len(win_history)) if win_history else 0.0
 
-                        optimizer.zero_grad()
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
-                        optimizer.step()
-                else:
-                    for mb in self._feed_forward_minibatches(batch, int(config["minibatch_size"]), self.device):
-                        obs_mb, masks_mb, actions_mb, old_logprob_mb, adv_mb, ret_mb, _ = mb
-                        logits, value, _ = policy(obs_mb, masks_mb)
-                        dist = Categorical(logits=logits)
-                        logprob = dist.log_prob(actions_mb)
-                        entropy = dist.entropy().mean()
-
-                        ratio = torch.exp(logprob - old_logprob_mb)
-                        surr1 = ratio * adv_mb
-                        surr2 = torch.clamp(
-                            ratio,
-                            1.0 - float(config["clip_eps"]),
-                            1.0 + float(config["clip_eps"]),
-                        ) * adv_mb
-                        policy_loss = -torch.min(surr1, surr2).mean()
-
-                        value_loss = F.mse_loss(value.squeeze(-1), ret_mb)
-                        loss = (
-                            policy_loss
-                            + float(config["value_coef"]) * value_loss
-                            - float(config["entropy_coef"]) * entropy
-                        )
-
-                        optimizer.zero_grad()
-                        loss.backward()
-                        torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=0.5)
-                        optimizer.step()
-
-            # Update logging buffers based on completed episodes in this rollout.
-            returns_window.extend(completed_returns)
-            wins_window.extend(completed_wins)
-
-            mean_return = float(np.mean(list(returns_window))) if returns_window else 0.0
-            mean_win = float(np.mean(list(wins_window))) if wins_window else 0.0
-
-            if update % log_interval == 0:
-                print(
-                    f"Update {update}/{total_updates}: mean_return={mean_return:.2f} "
-                    f"win_rate={mean_win:.2f}"
-                )
+            print(
+                f"Update {update + 1}/{total_updates} | "
+                f"return: {mean_return:.2f} | length: {mean_length:.1f} | "
+                f"win-rate: {win_rate:.2%} | moving win-rate: {moving_win_rate:.2%} | "
+                f"policy loss: {policy_loss:.3f} | value loss: {value_loss:.3f} | entropy: {entropy:.3f}",
+                flush=True,
+            )
 
             checkpoint = {
                 "model_state": policy.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
                 "config": config,
-                "update": update,
+                "update": update + 1,
+                "moving_win_rate": moving_win_rate,
             }
-            torch.save(checkpoint, self.checkpoint_dir / "latest.pt")
-            if mean_win > best_win_rate:
-                best_win_rate = mean_win
-                torch.save(checkpoint, self.checkpoint_dir / "best.pt")
+            ckpt_path = save_dir / f"ckpt_{update + 1:04d}.pt"
+            torch.save(checkpoint, ckpt_path)
+            if moving_win_rate >= best_win_rate:
+                best_win_rate = moving_win_rate
+                torch.save(checkpoint, save_dir / "best.pt")
 
         envs.close()
 
-    def evaluate(self, ckpt_path: str, episodes: int = 5) -> None:
-        checkpoint = torch.load(ckpt_path, map_location=self.device)
+    def evaluate(self, checkpoint_path: str, episodes: int = 10) -> None:
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
         config = checkpoint.get("config", {})
         use_lstm = bool(config.get("use_lstm", False))
+        opponent = str(config.get("opponent", "greedy"))
+
         if use_lstm:
-            policy: torch.nn.Module = ConvLSTMPolicy()
+            policy = ConvLSTMPolicy().to(self.device)
         else:
-            policy = ConvPolicy()
+            policy = ConvPolicy().to(self.device)
         policy.load_state_dict(checkpoint["model_state"])
-        policy = policy.to(self.device)
         policy.eval()
 
-        env = CRLiteEnv(opponent_policy="greedy", render_mode="rgb_array")
+        env = CRLiteEnv(opponent_policy=opponent, render_mode="rgb_array")
+
         returns: List[float] = []
-        wins = 0
-        for episode in range(episodes):
+        lengths: List[int] = []
+        wins: List[bool] = []
+
+        for _ in range(episodes):
             obs, info = env.reset()
+            done = False
+            episode_return = 0.0
+            episode_length = 0
             hx: Optional[Tuple[Tensor, Tensor]] = None
             if use_lstm:
-                hidden_size = policy.lstm.hidden_size  # type: ignore[attr-defined]
+                hidden_size = policy.lstm.hidden_size
                 hx = (
                     torch.zeros(1, 1, hidden_size, device=self.device),
                     torch.zeros(1, 1, hidden_size, device=self.device),
                 )
-            done = False
-            total_reward = 0.0
             while not done:
-                obs_tensor = _to_tensor(obs, self.device)
-                mask_tensor = _to_mask(info["action_mask"], self.device)
-                with torch.no_grad():
-                    logits, _, hx = policy(obs_tensor, mask_tensor, hx)
-                    action = torch.argmax(logits, dim=-1)
-                obs, reward, terminated, truncated, info = env.step(int(action.item()))
-                done = bool(terminated or truncated)
-                total_reward += float(reward)
-                if done and terminated:
-                    wins += int(not env.opponent_towers["king"].alive)
-                if done and use_lstm:
-                    hx = (
-                        torch.zeros_like(hx[0]),
-                        torch.zeros_like(hx[1]),
-                    )
-            returns.append(total_reward)
+                obs_tensor = _obs_to_tensor(obs, self.device)
+                mask_tensor = _mask_to_tensor(info["action_mask"], self.device)
+                logits, _, next_hx = policy(obs_tensor, action_mask=mask_tensor, hx=hx)
+                action = torch.argmax(logits, dim=-1).item()
 
-        mean_return = float(np.mean(returns)) if returns else 0.0
-        win_rate = wins / max(1, episodes)
+                obs, reward, terminated, truncated, info = env.step(action)
+                episode_return += float(reward)
+                episode_length += 1
+                done = bool(terminated or truncated)
+
+                if use_lstm and next_hx is not None:
+                    hx = (next_hx[0].detach(), next_hx[1].detach())
+                if done:
+                    if use_lstm and hx is not None:
+                        hx = (
+                            torch.zeros_like(hx[0]),
+                            torch.zeros_like(hx[1]),
+                        )
+
+            returns.append(episode_return)
+            lengths.append(episode_length)
+            wins.append(bool(info.get("win", False)))
+
+        mean_return = sum(returns) / len(returns)
+        mean_length = sum(lengths) / len(lengths)
+        win_rate = sum(wins) / len(wins)
         print(
-            f"Evaluation over {episodes} episodes: mean_return={mean_return:.2f}, "
-            f"win_rate={win_rate:.2f}"
+            f"Evaluation over {episodes} episodes | "
+            f"return: {mean_return:.2f} | length: {mean_length:.1f} | win-rate: {win_rate:.2%}",
+            flush=True,
         )
         env.close()
