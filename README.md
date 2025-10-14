@@ -10,3 +10,13 @@ source .venv/bin/activate
 pip install -r requirements.txt
 make setup
 ```
+
+## Verification
+
+After installing dependencies you can confirm the project is wired up correctly by running the bundled smoke test:
+
+```bash
+python scripts/smoke_test.py
+```
+
+The script steps through the CRLite environment, ensuring observations, action masks, and episode rollouts behave as expected.
